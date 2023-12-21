@@ -103,8 +103,20 @@ struct ipset_netlink_msg {
 	__be16 res_id;
 };
 
+enum daemon_msg_type {
+	DAEMON_MSG_KICKOFF,
+	DAEMON_MSG_KEEPALIVE,
+	DAEMON_MSG_DAEMON_PID,
+};
+
+struct daemon_msg {
+	enum daemon_msg_type type;
+	int value;
+};
+
 static int ipset_fd;
 static int pidfile_fd;
+static int daemon_fd;
 
 unsigned long get_tick_count(void)
 {
@@ -176,7 +188,8 @@ int generate_random_addr(unsigned char *addr, int addr_len, int mask)
 	return 0;
 }
 
-int generate_addr_map(unsigned char *addr_from, unsigned char *addr_to, unsigned char *addr_out, int addr_len, int mask)
+int generate_addr_map(const unsigned char *addr_from, const unsigned char *addr_to, unsigned char *addr_out,
+					  int addr_len, int mask)
 {
 	if ((mask / 8) >= addr_len) {
 		if (mask % 8 != 0) {
@@ -1052,6 +1065,10 @@ void SSL_CRYPTO_thread_setup(void)
 {
 	int i = 0;
 
+	if (lock_cs != NULL) {
+		return;
+	}
+
 	lock_cs = OPENSSL_malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
 	lock_count = OPENSSL_malloc(CRYPTO_num_locks() * sizeof(long));
 	if (!lock_cs || !lock_count) {
@@ -1081,12 +1098,18 @@ void SSL_CRYPTO_thread_cleanup(void)
 {
 	int i = 0;
 
+	if (lock_cs == NULL) {
+		return;
+	}
+
 	CRYPTO_set_locking_callback(NULL);
 	for (i = 0; i < CRYPTO_num_locks(); i++) {
 		pthread_mutex_destroy(&(lock_cs[i]));
 	}
 	OPENSSL_free(lock_cs);
 	OPENSSL_free(lock_count);
+	lock_cs = NULL;
+	lock_count = NULL;
 }
 #endif
 
@@ -1363,8 +1386,8 @@ int set_sock_keepalive(int fd, int keepidle, int keepinterval, int keepcnt)
 	}
 
 	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepinterval, sizeof(keepinterval));
-	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepcnt, sizeof(keepcnt));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepinterval, sizeof(keepinterval));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
 	return 0;
 }
@@ -1464,7 +1487,7 @@ void bug_ext(const char *file, int line, const char *func, const char *errfmt, .
 
 int write_file(const char *filename, void *data, int data_len)
 {
-	int fd = open(filename, O_WRONLY | O_CREAT, 0644);
+	int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, 0644);
 	if (fd < 0) {
 		return -1;
 	}
@@ -1512,9 +1535,9 @@ int dns_packet_save(const char *dir, const char *type, const char *from, const v
 
 	snprintf(time_s, sizeof(time_s) - 1, "%.4d-%.2d-%.2d %.2d:%.2d:%.2d.%.3d", ptm->tm_year + 1900, ptm->tm_mon + 1,
 			 ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec, (int)(tm_val.tv_usec / 1000));
-	snprintf(filename, sizeof(filename) - 1, "%s/%s-%.4d%.2d%.2d-%.2d%.2d%.2d%.1d.packet", dir, type,
+	snprintf(filename, sizeof(filename) - 1, "%s/%s-%.4d%.2d%.2d-%.2d%.2d%.2d%.3d.packet", dir, type,
 			 ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec,
-			 (int)(tm_val.tv_usec / 100000));
+			 (int)(tm_val.tv_usec / 1000));
 
 	data = malloc(PACKET_BUF_SIZE);
 	if (data == NULL) {
@@ -1609,39 +1632,78 @@ errout:
 	return;
 }
 
-int daemon_kickoff(int fd, int status, int no_close)
+void daemon_close_stdfds(void)
 {
-	if (fd <= 0) {
+	int fd_null = open("/dev/null", O_RDWR);
+	if (fd_null < 0) {
+		fprintf(stderr, "open /dev/null failed, %s\n", strerror(errno));
+		return;
+	}
+
+	dup2(fd_null, STDIN_FILENO);
+	dup2(fd_null, STDOUT_FILENO);
+	dup2(fd_null, STDERR_FILENO);
+
+	if (fd_null > 2) {
+		close(fd_null);
+	}
+}
+
+int daemon_kickoff(int status, int no_close)
+{
+	struct daemon_msg msg;
+
+	if (daemon_fd <= 0) {
 		return -1;
 	}
 
-	int ret = write(fd, &status, sizeof(status));
-	if (ret != sizeof(status)) {
+	msg.type = DAEMON_MSG_KICKOFF;
+	msg.value = status;
+
+	int ret = write(daemon_fd, &msg, sizeof(msg));
+	if (ret != sizeof(msg)) {
+		fprintf(stderr, "notify parent process failed, %s\n", strerror(errno));
 		return -1;
 	}
 
 	if (no_close == 0) {
-		int fd_null = open("/dev/null", O_RDWR);
-		if (fd_null < 0) {
-			fprintf(stderr, "open /dev/null failed, %s\n", strerror(errno));
-			return -1;
-		}
-
-		dup2(fd_null, STDIN_FILENO);
-		dup2(fd_null, STDOUT_FILENO);
-		dup2(fd_null, STDERR_FILENO);
-
-		if (fd_null > 2) {
-			close(fd_null);
-		}
+		daemon_close_stdfds();
 	}
 
-	close(fd);
+	close(daemon_fd);
+	daemon_fd = -1;
 
 	return 0;
 }
 
-int run_daemon()
+int daemon_keepalive(void)
+{
+	struct daemon_msg msg;
+	static time_t last = 0;
+	time_t now = time(NULL);
+
+	if (daemon_fd <= 0) {
+		return -1;
+	}
+
+	if (now == last) {
+		return 0;
+	}
+
+	last = now;
+
+	msg.type = DAEMON_MSG_KEEPALIVE;
+	msg.value = 0;
+
+	int ret = write(daemon_fd, &msg, sizeof(msg));
+	if (ret != sizeof(msg)) {
+		return -1;
+	}
+
+	return 0;
+}
+
+daemon_ret daemon_run(int *wstatus)
 {
 	pid_t pid = 0;
 	int fds[2] = {0};
@@ -1660,7 +1722,6 @@ int run_daemon()
 	} else if (pid > 0) {
 		struct pollfd pfd;
 		int ret = 0;
-		int status = 0;
 
 		close(fds[1]);
 
@@ -1668,22 +1729,40 @@ int run_daemon()
 		pfd.events = POLLIN;
 		pfd.revents = 0;
 
-		ret = poll(&pfd, 1, 1000);
-		if (ret <= 0) {
-			fprintf(stderr, "run daemon process failed, wait child timeout\n");
-			goto errout;
-		}
+		do {
+			ret = poll(&pfd, 1, 3000);
+			if (ret <= 0) {
+				fprintf(stderr, "run daemon process failed, wait child timeout, kill child.\n");
+				goto errout;
+			}
 
-		if (!(pfd.revents & POLLIN)) {
-			goto errout;
-		}
+			if (!(pfd.revents & POLLIN)) {
+				goto errout;
+			}
 
-		ret = read(fds[0], &status, sizeof(status));
-		if (ret != sizeof(status)) {
-			goto errout;
-		}
+			struct daemon_msg msg;
 
-		return status;
+			ret = read(fds[0], &msg, sizeof(msg));
+			if (ret != sizeof(msg)) {
+				goto errout;
+			}
+
+			if (msg.type == DAEMON_MSG_KEEPALIVE) {
+				continue;
+			} else if (msg.type == DAEMON_MSG_DAEMON_PID) {
+				pid = msg.value;
+				continue;
+			} else if (msg.type == DAEMON_MSG_KICKOFF) {
+				if (wstatus != NULL) {
+					*wstatus = msg.value;
+				}
+				return DAEMON_RET_PARENT_OK;
+			} else {
+				goto errout;
+			}
+		} while (true);
+
+		return DAEMON_RET_ERR;
 	}
 
 	setsid();
@@ -1693,6 +1772,11 @@ int run_daemon()
 		fprintf(stderr, "double fork failed, %s\n", strerror(errno));
 		_exit(1);
 	} else if (pid > 0) {
+		struct daemon_msg msg;
+		int unused __attribute__((unused));
+		msg.type = DAEMON_MSG_DAEMON_PID;
+		msg.value = pid;
+		unused = write(fds[1], &msg, sizeof(msg));
 		_exit(0);
 	}
 
@@ -1701,11 +1785,15 @@ int run_daemon()
 		goto errout;
 	}
 	close(fds[0]);
-	return fds[1];
 
+	daemon_fd = fds[1];
+	return DAEMON_RET_CHILD_OK;
 errout:
 	kill(pid, SIGKILL);
-	return -1;
+	if (wstatus != NULL) {
+		*wstatus = -1;
+	}
+	return DAEMON_RET_ERR;
 }
 
 #ifdef DEBUG
@@ -1824,6 +1912,24 @@ static int _dns_debug_display(struct dns_packet *packet)
 				req_host[0] = '\0';
 				inet_ntop(AF_INET6, addr, req_host, sizeof(req_host));
 				printf("domain: %s AAAA: %s TTL:%d\n", name, req_host, ttl);
+			} break;
+			case DNS_T_SRV: {
+				unsigned short priority = 0;
+				unsigned short weight = 0;
+				unsigned short port = 0;
+				int ret = 0;
+
+				char name[DNS_MAX_CNAME_LEN] = {0};
+				char target[DNS_MAX_CNAME_LEN];
+
+				ret = dns_get_SRV(rrs, name, DNS_MAX_CNAME_LEN, &ttl, &priority, &weight, &port, target, DNS_MAX_CNAME_LEN);
+				if (ret < 0) {
+					tlog(TLOG_DEBUG, "decode SRV failed, %s", name);
+					return -1;
+				}
+
+				printf("domain: %s SRV: %s TTL: %d priority: %d weight: %d port: %d\n", name, target, ttl, priority,
+					   weight, port);
 			} break;
 			case DNS_T_HTTPS: {
 				char name[DNS_MAX_CNAME_LEN] = {0};

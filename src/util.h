@@ -61,8 +61,8 @@ char *get_host_by_addr(char *host, int maxsize, struct sockaddr *addr);
 
 int generate_random_addr(unsigned char *addr, int addr_len, int mask);
 
-int generate_addr_map(unsigned char *addr_from, unsigned char *addr_to, unsigned char *addr_out, int addr_len,
-					  int mask);
+int generate_addr_map(const unsigned char *addr_from, const unsigned char *addr_to, unsigned char *addr_out,
+					  int addr_len, int mask);
 
 int getaddr_by_host(const char *host, struct sockaddr *addr, socklen_t *addr_len);
 
@@ -147,9 +147,20 @@ void print_stack(void);
 
 void close_all_fd(int keepfd);
 
-int run_daemon(void);
+typedef enum daemon_ret {
+	DAEMON_RET_OK = 0,
+	DAEMON_RET_ERR = -1,
+	DAEMON_RET_CHILD_OK = -2,
+	DAEMON_RET_PARENT_OK = -3,
+} daemon_ret;
 
-int daemon_kickoff(int fd, int status, int no_close);
+daemon_ret daemon_run(int *wstatus);
+
+int daemon_kickoff(int status, int no_close);
+
+int daemon_keepalive(void);
+
+void daemon_close_stdfds(void);
 
 int write_file(const char *filename, void *data, int data_len);
 
